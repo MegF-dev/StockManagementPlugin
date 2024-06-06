@@ -1,0 +1,6 @@
+{
+    "name": "mafie/stock-management-plugin",
+    "require": {
+        "phpoffice/phpspreadsheet": "^1.29"
+    }
+}
