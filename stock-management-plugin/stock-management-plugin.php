@@ -21,8 +21,13 @@ function stock_plugin_enqueue_scripts()
 
         wp_enqueue_script('jquery');
         wp_enqueue_script('plugin-script', plugin_dir_url(__FILE__) . 'plugin-script.js', array('jquery'), '1.0', true);
+        wp_localize_script('plugin-script', 'stock_ajax', array(
+            'ajax_url' => admin_url('admin-ajax.php'),
+            'nonce' => wp_create_nonce('process_stock_speadsheet_nonce')
+        ));
     }
 }
+
 
 add_action('admin_enqueue_scripts', 'stock_plugin_enqueue_scripts');
 add_action('admin_menu', 'register_stock_upload_menu');
@@ -45,11 +50,17 @@ function my_plugin_options()
     }
 
 
-    if ($updatedFile = get_transient('updated_spreadsheet_path')) {
+    if (get_transient('updated_spreadsheet_path')) {
         echo '<script type="text/javascript">
                 jQuery(document).ready(function($) {
                     $("#download-updated-spreadsheet").attr("href", "' . esc_url(admin_url('admin-post.php?action=download_updated_spreadsheet')) . '");
                     $("#download-button-container").show();
+                });
+              </script>';
+    } else {
+        echo '<script type="text/javascript">
+                jQuery(document).ready(function($) {
+                    $("#download-button-container").hide();
                 });
               </script>';
     }
@@ -62,13 +73,19 @@ function my_plugin_options()
       margin-left: 20px;
  
 }
-#form-messages .notice.is-dismissible, .stock-form-container .notice.notice-info {
+#form-messages .notice.is-dismissible, .stock-form-container .notice.notice-info,#form-messages .notice.notice-error{
     
     margin-left: 0 !important;
     margin-bottom: 15px !important;
-    width: fit-content !important;
+        width: auto !important;
 }
 
+.stock-form-container .notice-success,#binuns-stock-form div.updated,.notice-info {
+    border-left-color: #37665aa6 !important;
+}
+.stock-form-container .notice-success {
+margin-bottom: 15px !important;
+}
 .tooltip .tooltiptext {
       visibility: hidden;
     width: 200px;
@@ -158,6 +175,14 @@ font-size: 13px;
     font-weight: 700;
     margin-top: -10px !important;
 }
+    #clear-report-btn {
+        margin-left: 20px;
+    height: 37px;
+    background-color: white;
+    color: black;
+    border: 2px solid black;
+    text-transform: uppercase;
+    font-weight: 700;}
 </style>';
     echo '<div class="stock-form-container">';
     echo '
@@ -171,6 +196,10 @@ font-size: 13px;
           enctype="multipart/form-data">
         <input type="hidden" name="action" value="process_stock_speadsheet">
         <?php wp_nonce_field('process_stock_speadsheet_nonce'); ?>
+        <div id="progress-container" style="display: none;">
+    <div id="progress-bar" style="width: 0%; background-color: rgb(55, 102, 90); height: 30px; text-align: center; line-height: 30px; color: white;margin-bottom: 10px;
+    margin-top: 10px;">0%</div>
+</div>
         <table class="stock-upload-table">
             <tbody>
             <tr class="stock-upload">
@@ -413,8 +442,10 @@ font-size: 13px;
                 <td style="margin-top: 25px;">
                     <div id="download-button-container" style="display: none;">
                         <a href="#" class="button button-primary" id="download-updated-spreadsheet">Download
-                            Spreadsheet</a></div>
+                            Spreadsheet</a><button id="clear-report-btn" class="button" type="button">Clear</button>   <img id="loader-stock" src="/wp-content/uploads/2023/11/loader.gif"  style="display: none;width: 20px;position: relative; left: 15px;top: 5px;"></div>
 
+     
+      
                 </td>
             </tr>
             </tbody>
@@ -423,124 +454,322 @@ font-size: 13px;
 
     </form>
     <?php
-
+echo '<script type="text/javascript">
+jQuery(document).ready(function($) {
+    $("#clear-report-btn").on("click", function() {
+    $("#loader-stock").show();
+        $.ajax({
+            url: ajaxurl,
+            type: "POST",
+            data: {
+                action: "clear_stock_report"
+            },
+            success: function(response) {
+                if (response.success) {
+                    location.reload();
+                } else {
+                    alert("Failed to clear report.");
+                $("#loader-stock").hide();
+                }
+            }
+        });
+    });
+});
+</script>';
     echo '</div>';
 
 
 }
 
 
-function process_stock_speadsheet()
-{
-
-    if (!isset($_POST['_wpnonce']) || !wp_verify_nonce($_POST['_wpnonce'], 'process_stock_speadsheet_nonce')) {
-        set_transient('form_submission_status', 'Security check failed', 10);
-        wp_redirect(admin_url('admin.php?page=binuns-stock-management'));
-        exit;
+function process_stock_speadsheet() {
+    if (!check_ajax_referer('process_stock_speadsheet_nonce', 'security', false)) {
+        wp_send_json_error('Security check failed');
+        return;
     }
 
-    if (isset($_FILES['excel-stock-file'])) {
-        $file = $_FILES['excel-stock-file'];
-        $file_type = $file['type'];
+    if (!isset($_FILES['excel-stock-file'])) {
+        wp_send_json_error('No file uploaded');
+        return;
+    }
 
+    $file = $_FILES['excel-stock-file'];
+    $upload_dir = wp_upload_dir();
+    $file_name = sanitize_file_name($file['name']);
+    $file_path = $upload_dir['path'] . '/' . $file_name;
 
-        $allowed_types = array(
-            'application/vnd.ms-excel',
-            'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
-        );
+    if (move_uploaded_file($file['tmp_name'], $file_path)) {
+        require_once ABSPATH . 'wp-admin/includes/file.php';
+        WP_Filesystem();
+        global $wp_filesystem;
 
-        if (!in_array($file_type, $allowed_types)) {
-            set_transient('form_submission_status', 'Invalid file type. Please upload an Excel Spreadsheet file.', 10);
-        } else {
+        $spreadsheet = \PhpOffice\PhpSpreadsheet\IOFactory::load($file_path);
+        $worksheet = $spreadsheet->getActiveSheet();
+        $highestRow = $worksheet->getHighestRow();
 
+        $skuColumn = sanitize_text_field($_POST['sku-column']);
+        $qtyColumn = sanitize_text_field($_POST['stock-qty-column']);
+        $percentage = floatval($_POST['stock-percentage-column']) / 100;
+        $thresholdValue = isset($_POST['stock-threshold-column']) ? intval($_POST['stock-threshold-column']) : 0;
 
-            $skuColumn = sanitize_text_field($_POST['sku-column']);
-            $qtyColumn = sanitize_text_field($_POST['stock-qty-column']);
-            $percentage = floatval($_POST['stock-percentage-column']) / 100;
+        $chunkSize = 100; // Adjust based on your needs
+        $totalChunks = ceil(($highestRow - 1) / $chunkSize);
+        $highestColumn = $worksheet->getHighestColumn();
+        $highestColumnIndex = \PhpOffice\PhpSpreadsheet\Cell\Coordinate::columnIndexFromString($highestColumn);
 
-            $reader = \PhpOffice\PhpSpreadsheet\IOFactory::createReaderForFile($file['tmp_name']);
-            $spreadsheet = $reader->load($file['tmp_name']);
-            $worksheet = $spreadsheet->getActiveSheet();
+        // Safely set new columns after the highest column in the spreadsheet
+        $maxAllowedColumnIndex = 16384; // Excel's max column limit (XFD)
+        if ($highestColumnIndex + 4 > $maxAllowedColumnIndex) {
+            throw new Exception('Invalid cell coordinate: one of the required columns exceeds the spreadsheet size.');
+        }
 
-            $highestColumn = $worksheet->getHighestColumn();
-            $highestColumnIndex = \PhpOffice\PhpSpreadsheet\Cell\Coordinate::columnIndexFromString($highestColumn);
+        $preUpdateQtyCol = \PhpOffice\PhpSpreadsheet\Cell\Coordinate::stringFromColumnIndex($highestColumnIndex + 1);
+        $postUpdateQtyCol = \PhpOffice\PhpSpreadsheet\Cell\Coordinate::stringFromColumnIndex($highestColumnIndex + 2);
+        $thresholdCol = \PhpOffice\PhpSpreadsheet\Cell\Coordinate::stringFromColumnIndex($highestColumnIndex + 3);
+        $productExistsCol = \PhpOffice\PhpSpreadsheet\Cell\Coordinate::stringFromColumnIndex($highestColumnIndex + 4);
 
-            $preUpdateQtyCol = \PhpOffice\PhpSpreadsheet\Cell\Coordinate::stringFromColumnIndex($highestColumnIndex + 1);
-            $postUpdateQtyCol = \PhpOffice\PhpSpreadsheet\Cell\Coordinate::stringFromColumnIndex($highestColumnIndex + 2);
-            $thresholdCol = \PhpOffice\PhpSpreadsheet\Cell\Coordinate::stringFromColumnIndex($highestColumnIndex + 3);
-            $productExistsCol = \PhpOffice\PhpSpreadsheet\Cell\Coordinate::stringFromColumnIndex($highestColumnIndex + 4);
+        // Now safely continue to set values in these columns
+        $worksheet->setCellValue($preUpdateQtyCol . '1', 'Quantity Pre Update');
+        $worksheet->setCellValue($postUpdateQtyCol . '1', 'Quantity Post Update');
+        $worksheet->setCellValue($thresholdCol . '1', 'Product on minimum threshold?');
+        $worksheet->setCellValue($productExistsCol . '1', 'Product exists on the system');
 
-            $worksheet->setCellValue($preUpdateQtyCol . '1', 'Quantity Pre Update');
-            $worksheet->setCellValue($postUpdateQtyCol . '1', 'Quantity Post Update');
-            $worksheet->setCellValue($thresholdCol . '1', 'Product on minimum threshold?');
-            $worksheet->setCellValue($productExistsCol . '1', 'Product exists on the system');
+        $writer = \PhpOffice\PhpSpreadsheet\IOFactory::createWriter($spreadsheet, 'Xlsx');
+        $temp_file = tempnam(sys_get_temp_dir(), 'updated_stock_') . '.xlsx';
+        $writer->save($temp_file);
 
+        set_transient('updated_spreadsheet_path', $temp_file, DAY_IN_SECONDS);
+        set_transient('stock_update_progress', 0, DAY_IN_SECONDS);
+        set_transient('stock_update_total_chunks', $totalChunks, DAY_IN_SECONDS);
 
-            foreach ($worksheet->getRowIterator(2) as $row) {
-                $rowIndex = $row->getRowIndex();
-                $skuCell = $worksheet->getCell($skuColumn . $row->getRowIndex());
-                $qtyCell = $worksheet->getCell($qtyColumn . $row->getRowIndex());
+        wp_send_json_success([
+            'message' => 'File uploaded and prepared successfully',
+            'filePath' => $temp_file,
+            'totalChunks' => $totalChunks,
+            'chunkSize' => $chunkSize,
+            'totalRows' => $highestRow - 1,
+            'skuColumn' => $skuColumn,
+            'qtyColumn' => $qtyColumn,
+            'percentage' => $percentage,
+            'thresholdValue' => $thresholdValue,
+            'preUpdateQtyCol' => $preUpdateQtyCol,
+            'postUpdateQtyCol' => $postUpdateQtyCol,
+            'thresholdCol' => $thresholdCol,
+            'productExistsCol' => $productExistsCol
+        ]);
+    } else {
+        wp_send_json_error('Failed to move uploaded file');
+    }
+}
+add_action('wp_ajax_process_stock_speadsheet', 'process_stock_speadsheet');
 
-                $sku = $skuCell->getValue();
-                $qty = floatval($qtyCell->getValue()) * $percentage;
+function process_stock_batch() {
+    if (!check_ajax_referer('process_stock_speadsheet_nonce', 'security', false)) {
+        wp_send_json_error('Security check failed');
+        return;
+    }
 
+    $chunkNumber = isset($_POST['chunkNumber']) ? intval($_POST['chunkNumber']) : 0;
+    $filePath = isset($_POST['filePath']) ? $_POST['filePath'] : '';
+    $chunkSize = isset($_POST['chunkSize']) ? intval($_POST['chunkSize']) : 100;
+    $skuColumn = isset($_POST['skuColumn']) ? $_POST['skuColumn'] : 'A';
+    $qtyColumn = isset($_POST['qtyColumn']) ? $_POST['qtyColumn'] : 'B';
+    $percentage = isset($_POST['percentage']) ? floatval($_POST['percentage']) : 1;
+    $thresholdValue = isset($_POST['thresholdValue']) ? intval($_POST['thresholdValue']) : 0;
+    $totalChunks = isset($_POST['totalChunks']) ? intval($_POST['totalChunks']) : 1;
+    $preUpdateQtyCol = isset($_POST['preUpdateQtyCol']) ? $_POST['preUpdateQtyCol'] : '';
+    $postUpdateQtyCol = isset($_POST['postUpdateQtyCol']) ? $_POST['postUpdateQtyCol'] : '';
+    $thresholdCol = isset($_POST['thresholdCol']) ? $_POST['thresholdCol'] : '';
+    $productExistsCol = isset($_POST['productExistsCol']) ? $_POST['productExistsCol'] : '';
 
-                $updateResult = update_product_stock($sku, $qty);
+    if (!$filePath || !file_exists($filePath)) {
+        wp_send_json_error('Invalid file path');
+        return;
+    }
 
-               
+    try {
+        $reader = \PhpOffice\PhpSpreadsheet\IOFactory::createReader('Xlsx');
+        $reader->setReadDataOnly(false);
+        $spreadsheet = $reader->load($filePath);
+        $worksheet = $spreadsheet->getActiveSheet();
+        
+        $startRow = ($chunkNumber - 1) * $chunkSize + 2;
+        $endRow = min($startRow + $chunkSize - 1, $worksheet->getHighestRow());
 
-                $worksheet->setCellValue($preUpdateQtyCol . $rowIndex, $updateResult['preUpdateQty']);
-                $worksheet->setCellValue($postUpdateQtyCol . $rowIndex, floor($updateResult['postUpdateQty']));
-                $worksheet->setCellValue($thresholdCol . $rowIndex, $updateResult['thresholdUsed'] ? 'Yes' : 'No');
-                $worksheet->setCellValue($productExistsCol . $rowIndex, $updateResult['productExists'] ? 'Yes' : 'No');
+        $highestColumn = $worksheet->getHighestColumn();
+        $highestColumnIndex = \PhpOffice\PhpSpreadsheet\Cell\Coordinate::columnIndexFromString($highestColumn);
+
+        // Ensure new columns do not exceed the max allowed columns
+        $maxAllowedColumnIndex = 16384; // Excel's max column limit (XFD)
+        if ($highestColumnIndex + 4 > $maxAllowedColumnIndex) {
+            throw new Exception('Invalid cell coordinate: one of the required columns exceeds the spreadsheet size.');
+        }
+
+        $skuQtyMap = [];
+        $updatedProducts = 0;
+        $processedProducts = 0;
+
+        for ($row = $startRow; $row <= $endRow; $row++) {
+            $sku = $worksheet->getCell($skuColumn . $row)->getValue();
+            $qty = $worksheet->getCell($qtyColumn . $row)->getValue();
+
+            if ($sku && is_numeric($qty)) {
+                $adjustedQty = floor(floatval($qty) * $percentage);
+                $skuQtyMap[$sku] = [
+                    'quantity' => $adjustedQty,
+                    'row' => $row,  // Store the row number for later use
+                ];
+                $processedProducts++;
+            } else {
+                // Mark invalid products in the spreadsheet
+                $worksheet->setCellValue($preUpdateQtyCol . $row, 'N/A');
+                $worksheet->setCellValue($postUpdateQtyCol . $row, 'N/A');
+                $worksheet->setCellValue($thresholdCol . $row, 'N/A');
+                $worksheet->setCellValue($productExistsCol . $row, 'No');
             }
-            $writer = \PhpOffice\PhpSpreadsheet\IOFactory::createWriter($spreadsheet, 'Xlsx');
-            $temp_file = tempnam(sys_get_temp_dir(), 'updated_stock_') . '.xlsx';
-            $writer->save($temp_file);
-
-            set_transient('updated_spreadsheet_path', $temp_file, 60);
-            set_transient('form_submission_status', 'Product stock has been successfully updated.', 60);
-
         }
 
-        wp_redirect(admin_url('admin.php?page=binuns-stock-management'));
-        exit;
+        // Perform bulk update for this chunk
+        $result = bulk_update_product_stock($skuQtyMap, $thresholdValue);
+
+        // Update the spreadsheet with the bulk update results
+        foreach ($result as $sku => $data) {
+            $row = $skuQtyMap[$sku]['row'];
+        
+            // Ensure values are scalar types before setting cell values
+            $preUpdateQty = is_scalar($data['preUpdateQty']) ? $data['preUpdateQty'] : 'N/A';
+            $postUpdateQty = is_scalar($data['postUpdateQty']) ? $data['postUpdateQty'] : 'N/A';
+            $thresholdUsed = is_scalar($data['thresholdUsed']) ? ($data['thresholdUsed'] ? 'Yes' : 'No') : 'N/A';
+            $productExists = is_scalar($data['productExists']) ? ($data['productExists'] ? 'Yes' : 'No') : 'N/A';
+        
+            // Set the values in the spreadsheet cells
+            $worksheet->setCellValue($preUpdateQtyCol . $row, $preUpdateQty);
+            $worksheet->setCellValue($postUpdateQtyCol . $row, $postUpdateQty);
+            $worksheet->setCellValue($thresholdCol . $row, $thresholdUsed);
+            $worksheet->setCellValue($productExistsCol . $row, $productExists);
+        
+            if ($data['productExists'] && $data['updated']) {
+                $updatedProducts++;
+            }
+        }
+
+        // Save the updated spreadsheet
+        $writer = \PhpOffice\PhpSpreadsheet\IOFactory::createWriter($spreadsheet, 'Xlsx');
+        $writer->save($filePath);
+
+        // Calculate progress
+        $progress = ($chunkNumber / $totalChunks) * 100;
+        set_transient('stock_update_progress', $progress, DAY_IN_SECONDS);
+
+        // Return the response
+        wp_send_json_success([
+            'chunkNumber' => $chunkNumber,
+            'updatedProducts' => $updatedProducts,
+            'processedProducts' => $processedProducts,
+            'progress' => $progress
+        ]);
+
+    } catch (Exception $e) {
+        // Log the error and return the error response
+        error_log('Error processing chunk: ' . $e->getMessage());
+        wp_send_json_error('Error processing chunk: ' . $e->getMessage());
     }
-
 }
+add_action('wp_ajax_process_stock_batch', 'process_stock_batch');
+function bulk_update_product_stock($skuQtyMap, $threshold) {
+    global $wpdb;
+    $skuCases = [];
+    $ids = [];
+    $result = [];
 
-add_action('admin_post_process_stock_speadsheet', 'process_stock_speadsheet');
+    foreach ($skuQtyMap as $sku => $data) {
+        $product_id = wc_get_product_id_by_sku($sku);
+        $quantity = $data['quantity'];
+        $row = $data['row']; // Row number from spreadsheet
 
-function update_product_stock($sku, $quantity)
-{
-    $product_id = wc_get_product_id_by_sku($sku);
-    $thresholdUsed = false;
-    $preUpdateQty = 0;
-    $postUpdateQty = 0;
-    $productExists = false;
+        if ($product_id) {
+            // Get the current stock quantity
+            $preUpdateQty = get_post_meta($product_id, '_stock', true);
+            $newQuantity = ($quantity <= $threshold) ? 0 : $quantity;
 
-    if ($product_id) {
-        $productExists = true;
-        $product = wc_get_product($product_id);
-        $preUpdateQty = $product->get_stock_quantity();
+            // Prepare bulk update query
+            $skuCases[] = $wpdb->prepare("WHEN %d THEN %d", $product_id, $newQuantity);
+            $ids[] = $product_id;
 
-        $threshold = isset($_POST['stock-threshold-column']) ? intval($_POST['stock-threshold-column']) : 0;
-        if ($quantity < $threshold) {
-            $product->set_stock_quantity($threshold);
-            $thresholdUsed = true;
-            $postUpdateQty = $threshold;
+            // Prepare result array for spreadsheet update
+            $result[$sku] = [
+                'preUpdateQty' => $preUpdateQty,
+                'postUpdateQty' => $newQuantity,
+                'thresholdUsed' => ($quantity <= $threshold),
+                'productExists' => true,
+                'updated' => ($preUpdateQty != $newQuantity)
+            ];
         } else {
-            $product->set_stock_quantity($quantity);
-            $postUpdateQty = $quantity;
+            // Product doesn't exist, mark as such in the result
+            $result[$sku] = [
+                'preUpdateQty' => 'N/A',
+                'postUpdateQty' => 'N/A',
+                'thresholdUsed' => false,
+                'productExists' => false,
+                'updated' => false
+            ];
         }
-
-        $product->save();
     }
 
-    return array('preUpdateQty' => $preUpdateQty, 'thresholdUsed' => $thresholdUsed, 'postUpdateQty' => $postUpdateQty, 'productExists' => $productExists);
+    // Only run the bulk update query if there are cases to update
+    if (!empty($skuCases)) {
+        $sql = "
+            UPDATE {$wpdb->prefix}postmeta
+            SET meta_value = CASE post_id
+                " . implode(' ', $skuCases) . "
+                END
+            WHERE meta_key = '_stock' AND post_id IN (" . implode(',', $ids) . ")
+        ";
+        $wpdb->query($sql);
+    }
+
+    return $result;
 }
+function update_product_stock($sku, $quantity, $threshold) {
+    $product_id = wc_get_product_id_by_sku($sku);
+    if (!$product_id) {
+        error_log("Product with SKU $sku not found");
+        return array('productExists' => false);
+    }
+    $product = wc_get_product($product_id);
+    $preUpdateQty = $product->get_stock_quantity();
+    $thresholdUsed = false;
 
+    // Initialize newQuantity
+    $newQuantity = $preUpdateQty;
 
+    // Apply threshold logic: Set stock to 0 if quantity is 0 or less than/equal to the threshold
+    if ($quantity == 0 || $quantity <= $threshold) {
+        $thresholdUsed = true;
+        $newQuantity = 0;
+    } else {
+        // If quantity is above the threshold, set it to the floored value of the quantity
+        $newQuantity = floor($quantity);
+    }
+
+    // Only update if the stock quantity is different
+    if ($preUpdateQty !== $newQuantity) {
+        $product->set_stock_quantity($newQuantity);
+        $product->save();
+        error_log("Updated product $sku: $preUpdateQty -> $newQuantity (Threshold: $threshold, Original Quantity: $quantity)");
+    } else {
+        error_log("No change in quantity for product $sku (Threshold: $threshold, Original Quantity: $quantity)");
+    }
+
+    // Return the update result
+    return array(
+        'preUpdateQty' => $preUpdateQty,
+        'postUpdateQty' => $newQuantity,
+        'thresholdUsed' => $thresholdUsed,
+        'productExists' => true,
+        'updated' => ($preUpdateQty !== $newQuantity)
+    );
+}
 function display_form_submission_message()
 {
     if ($message = get_transient('form_submission_status')) {
@@ -561,23 +790,69 @@ function display_form_submission_message()
 add_action('admin_notices', 'display_form_submission_message');
 
 
-function handle_download_updated_spreadsheet()
-{
-    if ($filePath = get_transient('updated_spreadsheet_path')) {
-        if (file_exists($filePath)) {
-            header('Content-Description: File Transfer');
-            header('Content-Type: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-            header('Content-Disposition: attachment; filename="Binuns_Stock_Report.xlsx"');
-            header('Expires: 0');
-            header('Cache-Control: must-revalidate');
-            header('Pragma: public');
-            header('Content-Length: ' . filesize($filePath));
-            flush(); 
-            readfile($filePath);
-            exit;
-        }
+function handle_download_updated_spreadsheet() {
+    check_ajax_referer('process_stock_speadsheet_nonce', 'security');
+    
+    $filePath = get_transient('updated_spreadsheet_path');
+    if ($filePath && file_exists($filePath)) {
+        $fileName = basename($filePath);
+        header('Content-Type: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+        header('Content-Disposition: attachment; filename="' . $fileName . '"');
+        header('Content-Length: ' . filesize($filePath));
+        header('Cache-Control: max-age=0');
+        header('Pragma: public');
+        
+        readfile($filePath);
+        exit;
+    } else {
+        wp_send_json_error('File not found or access denied.');
     }
-    wp_die('File not found or access denied.');
+}
+add_action('wp_ajax_download_updated_spreadsheet', 'handle_download_updated_spreadsheet');
+
+function clear_stock_report() {
+    $file_path = get_transient('updated_spreadsheet_path');
+    if ($file_path && file_exists($file_path)) {
+        unlink($file_path);
+    }
+    delete_transient('updated_spreadsheet_path');
+    wp_send_json_success('Report cleared successfully.');
+}
+add_action('wp_ajax_clear_stock_report', 'clear_stock_report');
+
+function check_file_permissions($filePath) {
+    if (!file_exists($filePath)) {
+        error_log("File does not exist: $filePath");
+        return false;
+    }
+    if (!is_readable($filePath)) {
+        error_log("File is not readable: $filePath");
+        return false;
+    }
+    return true;
 }
 
-add_action('admin_post_download_updated_spreadsheet', 'handle_download_updated_spreadsheet');
+function check_file_integrity($filePath) {
+    $zip = new ZipArchive;
+    if ($zip->open($filePath) === TRUE) {
+        $zip->close();
+        return true;
+    } else {
+        error_log("Failed to open Excel file as ZIP: $filePath");
+        return false;
+    }
+}
+
+function check_stock_update_progress() {
+    $progress = get_transient('stock_update_progress');
+    $totalChunks = get_transient('stock_update_total_chunks');
+    $currentChunk = ceil(($progress / 100) * $totalChunks);
+    
+    wp_send_json_success([
+        'progress' => $progress,
+        'currentChunk' => $currentChunk,
+        'totalChunks' => $totalChunks
+    ]);
+}
+
+add_action('wp_ajax_check_stock_update_progress', 'check_stock_update_progress');
